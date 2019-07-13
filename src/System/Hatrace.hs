@@ -18,7 +18,9 @@ module System.Hatrace
   , sourceTraceForkExecvFullPathWithSink
   , procToArgv
   , forkExecvWithPtrace
-  , printSyscallOrSignalNameConduit
+  , formatHatraceEventConduit
+  , printHatraceEvent
+  , printHatraceEventJson
   , SyscallEnterDetails_open(..)
   , SyscallExitDetails_open(..)
   , SyscallEnterDetails_openat(..)
@@ -69,6 +71,10 @@ module System.Hatrace
   , SyscallExitDetails_time(..)
   , SyscallEnterDetails_brk(..)
   , SyscallExitDetails_brk(..)
+  , SyscallEnterDetails_arch_prctl(..)
+  , SyscallExitDetails_arch_prctl(..)
+  , SyscallEnterDetails_set_tid_address(..)
+  , SyscallExitDetails_set_tid_address(..)
   , DetailedSyscallEnter(..)
   , DetailedSyscallExit(..)
   , ERRNO(..)
@@ -97,9 +103,12 @@ import           Conduit (foldlC)
 import           Control.Arrow (second)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Control.Monad.IO.Unlift (MonadUnliftIO)
+import           Data.Aeson (ToJSON(..), (.=), encode, object)
 import           Data.Bits ((.|.), shiftL, shiftR)
 import           Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
+import qualified Data.ByteString.Lazy as BSL
 import           Data.Conduit
 import qualified Data.Conduit.List as CL
 import           Data.Either (partitionEithers)
@@ -139,6 +148,7 @@ import           System.Posix.Waitpid (waitpid, waitpidFullStatus, Status(..), F
 import           UnliftIO.Concurrent (runInBoundThread)
 import           UnliftIO.IORef (newIORef, writeIORef, readIORef)
 
+import           System.Hatrace.Format
 import           System.Hatrace.SignalMap (signalMap)
 import           System.Hatrace.SyscallTables.Generated (KnownSyscall(..), syscallName, syscallMap_i386, syscallMap_x64_64)
 import           System.Hatrace.Types
@@ -377,11 +387,20 @@ data SyscallEnterDetails_open = SyscallEnterDetails_open
   , pathnameBS :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_open where
+  syscallEnterToFormatted SyscallEnterDetails_open{ pathnameBS, flags, mode } =
+    FormattedSyscall "open" [formatArg pathnameBS, formatArg flags, formatArg mode]
+
 
 data SyscallExitDetails_open = SyscallExitDetails_open
   { enterDetail :: SyscallEnterDetails_open
   , fd :: CInt
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_open where
+  syscallExitToFormatted SyscallExitDetails_open{ enterDetail, fd } =
+    (syscallEnterToFormatted enterDetail, formatReturn fd)
+
 
 data SyscallEnterDetails_openat = SyscallEnterDetails_openat
   { dirfd :: CInt
@@ -392,10 +411,22 @@ data SyscallEnterDetails_openat = SyscallEnterDetails_openat
   , pathnameBS :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_openat where
+  syscallEnterToFormatted SyscallEnterDetails_openat{ dirfd, pathnameBS, flags, mode } =
+    FormattedSyscall "openat" [ formatArg dirfd, formatArg pathnameBS
+                              , formatArg flags, formatArg mode
+                              ]
+
+
 data SyscallExitDetails_openat = SyscallExitDetails_openat
   { enterDetail :: SyscallEnterDetails_openat
   , fd :: CInt
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_openat where
+  syscallExitToFormatted SyscallExitDetails_openat{ enterDetail, fd } =
+    (syscallEnterToFormatted enterDetail, formatReturn fd)
+
 
 data SyscallEnterDetails_creat = SyscallEnterDetails_creat
   { pathname :: Ptr CChar
@@ -404,14 +435,28 @@ data SyscallEnterDetails_creat = SyscallEnterDetails_creat
   , pathnameBS :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_creat where
+  syscallEnterToFormatted SyscallEnterDetails_creat{ pathnameBS, mode } =
+    FormattedSyscall "creat" [formatArg pathnameBS, formatArg mode]
+
+
 data SyscallExitDetails_creat = SyscallExitDetails_creat
   { enterDetail :: SyscallEnterDetails_creat
   , fd :: CInt
   } deriving (Eq, Ord, Show)
 
+instance SyscallExitFormatting SyscallExitDetails_creat where
+  syscallExitToFormatted SyscallExitDetails_creat{ enterDetail, fd } =
+    (syscallEnterToFormatted enterDetail, formatReturn fd)
+
+
 data SyscallEnterDetails_pipe = SyscallEnterDetails_pipe
   { pipefd :: Ptr CInt
   } deriving (Eq, Ord, Show)
+
+instance SyscallEnterFormatting SyscallEnterDetails_pipe where
+  syscallEnterToFormatted  SyscallEnterDetails_pipe{ } = FormattedSyscall "pipe" []
+
 
 data SyscallExitDetails_pipe = SyscallExitDetails_pipe
   { enterDetail :: SyscallEnterDetails_pipe
@@ -419,10 +464,19 @@ data SyscallExitDetails_pipe = SyscallExitDetails_pipe
   , writefd :: CInt
   } deriving (Eq, Ord, Show)
 
+instance SyscallExitFormatting SyscallExitDetails_pipe where
+  syscallExitToFormatted SyscallExitDetails_pipe{ enterDetail } =
+    (syscallEnterToFormatted enterDetail, NoReturn)
+
+
 data SyscallEnterDetails_pipe2 = SyscallEnterDetails_pipe2
   { pipefd :: Ptr CInt
   , flags :: CInt
   } deriving (Eq, Ord, Show)
+
+instance SyscallEnterFormatting SyscallEnterDetails_pipe2 where
+  syscallEnterToFormatted  SyscallEnterDetails_pipe2{ } = FormattedSyscall "pipe2" []
+
 
 data SyscallExitDetails_pipe2 = SyscallExitDetails_pipe2
   { enterDetail :: SyscallEnterDetails_pipe2
@@ -430,21 +484,46 @@ data SyscallExitDetails_pipe2 = SyscallExitDetails_pipe2
   , writefd :: CInt
   } deriving (Eq, Ord, Show)
 
+instance SyscallExitFormatting SyscallExitDetails_pipe2 where
+  syscallExitToFormatted SyscallExitDetails_pipe2{ enterDetail } =
+    (syscallEnterToFormatted enterDetail, NoReturn)
+
+
 data SyscallEnterDetails_exit = SyscallEnterDetails_exit
   { status :: CInt
   } deriving (Eq, Ord, Show)
+
+instance SyscallEnterFormatting SyscallEnterDetails_exit where
+  syscallEnterToFormatted SyscallEnterDetails_exit{ status } =
+    FormattedSyscall "exit"  [formatArg status]
+
 
 data SyscallExitDetails_exit = SyscallExitDetails_exit
   { enterDetail :: SyscallEnterDetails_exit
   } deriving (Eq, Ord, Show)
 
+instance SyscallExitFormatting SyscallExitDetails_exit where
+  syscallExitToFormatted SyscallExitDetails_exit{ enterDetail } =
+    (syscallEnterToFormatted enterDetail, NoReturn)
+
+
 data SyscallEnterDetails_exit_group = SyscallEnterDetails_exit_group
   { status :: CInt
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_exit_group where
+  syscallEnterToFormatted SyscallEnterDetails_exit_group{ status } =
+    FormattedSyscall "exit_group" [formatArg status]
+
+
 data SyscallExitDetails_exit_group = SyscallExitDetails_exit_group
   { enterDetail :: SyscallEnterDetails_exit_group
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_exit_group where
+  syscallExitToFormatted SyscallExitDetails_exit_group{ enterDetail } =
+    (syscallEnterToFormatted enterDetail, NoReturn)
+
 
 data SyscallEnterDetails_write = SyscallEnterDetails_write
   { fd :: CInt
@@ -454,11 +533,19 @@ data SyscallEnterDetails_write = SyscallEnterDetails_write
   , bufContents :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_write where
+  syscallEnterToFormatted SyscallEnterDetails_write{ fd, bufContents, count } =
+    FormattedSyscall "write" [formatArg fd, formatArg bufContents, formatArg count]
+
 
 data SyscallExitDetails_write = SyscallExitDetails_write
   { enterDetail :: SyscallEnterDetails_write
   , writtenCount :: CSize
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_write where
+  syscallExitToFormatted SyscallExitDetails_write{ enterDetail, writtenCount } =
+    (syscallEnterToFormatted enterDetail, formatReturn writtenCount)
 
 
 data SyscallEnterDetails_read = SyscallEnterDetails_read
@@ -466,6 +553,10 @@ data SyscallEnterDetails_read = SyscallEnterDetails_read
   , buf :: Ptr Void
   , count :: CSize
   } deriving (Eq, Ord, Show)
+
+instance SyscallEnterFormatting SyscallEnterDetails_read where
+  syscallEnterToFormatted SyscallEnterDetails_read{ fd, count } =
+    FormattedSyscall "read" [formatArg fd, argPlaceholder "*buf", formatArg count]
 
 
 data SyscallExitDetails_read = SyscallExitDetails_read
@@ -475,15 +566,31 @@ data SyscallExitDetails_read = SyscallExitDetails_read
   , bufContents :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallExitFormatting SyscallExitDetails_read where
+  syscallExitToFormatted SyscallExitDetails_read{ enterDetail, bufContents, readCount } =
+    ( FormattedSyscall "read" [formatArg fd, formatArg bufContents, formatArg count]
+    , formatReturn readCount
+    )
+    where
+      SyscallEnterDetails_read{ fd, count } = enterDetail
+
 
 data SyscallEnterDetails_close = SyscallEnterDetails_close
   { fd :: CInt
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_close where
+  syscallEnterToFormatted SyscallEnterDetails_close{ fd } =
+    FormattedSyscall "close" [formatArg fd]
+
 
 data SyscallExitDetails_close = SyscallExitDetails_close
   { enterDetail :: SyscallEnterDetails_close
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_close where
+  syscallExitToFormatted SyscallExitDetails_close{ enterDetail } =
+    (syscallEnterToFormatted enterDetail, NoReturn)
 
 
 data SyscallEnterDetails_rename = SyscallEnterDetails_rename
@@ -494,10 +601,18 @@ data SyscallEnterDetails_rename = SyscallEnterDetails_rename
   , newpathBS :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_rename where
+  syscallEnterToFormatted SyscallEnterDetails_rename{ oldpathBS, newpathBS } =
+    FormattedSyscall "rename" [formatArg oldpathBS, formatArg newpathBS]
+
 
 data SyscallExitDetails_rename = SyscallExitDetails_rename
   { enterDetail :: SyscallEnterDetails_rename
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_rename where
+  syscallExitToFormatted SyscallExitDetails_rename{ enterDetail } =
+    (syscallEnterToFormatted enterDetail, NoReturn)
 
 
 data SyscallEnterDetails_renameat = SyscallEnterDetails_renameat
@@ -510,10 +625,20 @@ data SyscallEnterDetails_renameat = SyscallEnterDetails_renameat
   , newpathBS :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_renameat where
+  syscallEnterToFormatted SyscallEnterDetails_renameat{ olddirfd, oldpathBS, newdirfd, newpathBS } =
+    FormattedSyscall "renameat" [ formatArg olddirfd, formatArg oldpathBS
+                                , formatArg newdirfd, formatArg newpathBS
+                                ]
+
 
 data SyscallExitDetails_renameat = SyscallExitDetails_renameat
   { enterDetail :: SyscallEnterDetails_renameat
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_renameat where
+  syscallExitToFormatted SyscallExitDetails_renameat{ enterDetail } =
+    (syscallEnterToFormatted enterDetail, NoReturn)
 
 
 data SyscallEnterDetails_renameat2 = SyscallEnterDetails_renameat2
@@ -527,10 +652,21 @@ data SyscallEnterDetails_renameat2 = SyscallEnterDetails_renameat2
   , newpathBS :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_renameat2 where
+  syscallEnterToFormatted SyscallEnterDetails_renameat2{ olddirfd, oldpathBS, newdirfd, newpathBS, flags } =
+    FormattedSyscall "renameat2" [ formatArg olddirfd, formatArg oldpathBS
+                                 , formatArg newdirfd, formatArg newpathBS
+                                 , formatArg flags
+                                 ]
+
 
 data SyscallExitDetails_renameat2 = SyscallExitDetails_renameat2
   { enterDetail :: SyscallEnterDetails_renameat2
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_renameat2 where
+  syscallExitToFormatted SyscallExitDetails_renameat2{ enterDetail } =
+    (syscallEnterToFormatted enterDetail, NoReturn)
 
 
 data SyscallEnterDetails_access = SyscallEnterDetails_access
@@ -541,10 +677,18 @@ data SyscallEnterDetails_access = SyscallEnterDetails_access
   , pathnameBS :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_access where
+  syscallEnterToFormatted SyscallEnterDetails_access{ pathnameBS, accessMode } =
+    FormattedSyscall "access" [formatArg pathnameBS, formatArg accessMode]
+
 
 data SyscallExitDetails_access = SyscallExitDetails_access
   { enterDetail :: SyscallEnterDetails_access
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_access where
+  syscallExitToFormatted SyscallExitDetails_access{ enterDetail } =
+    (syscallEnterToFormatted enterDetail, NoReturn)
 
 
 data SyscallEnterDetails_faccessat = SyscallEnterDetails_faccessat
@@ -557,10 +701,20 @@ data SyscallEnterDetails_faccessat = SyscallEnterDetails_faccessat
   , pathnameBS :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_faccessat where
+  syscallEnterToFormatted SyscallEnterDetails_faccessat{ dirfd, pathnameBS, accessMode, flags } =
+    FormattedSyscall "faccessat" [ formatArg dirfd, formatArg pathnameBS
+                                 , formatArg accessMode, formatArg flags
+                                 ]
+
 
 data SyscallExitDetails_faccessat = SyscallExitDetails_faccessat
   { enterDetail :: SyscallEnterDetails_faccessat
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_faccessat where
+  syscallExitToFormatted SyscallExitDetails_faccessat{ enterDetail } =
+    (syscallEnterToFormatted enterDetail, NoReturn)
 
 
 data SyscallEnterDetails_stat = SyscallEnterDetails_stat
@@ -570,6 +724,10 @@ data SyscallEnterDetails_stat = SyscallEnterDetails_stat
   , pathnameBS :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_stat where
+  syscallEnterToFormatted SyscallEnterDetails_stat{ pathnameBS } =
+    FormattedSyscall "stat" [formatArg pathnameBS, argPlaceholder "*statbuf"]
+
 
 data SyscallExitDetails_stat = SyscallExitDetails_stat
   { enterDetail :: SyscallEnterDetails_stat
@@ -577,11 +735,23 @@ data SyscallExitDetails_stat = SyscallExitDetails_stat
   , stat :: StatStruct
   } deriving (Eq, Ord, Show)
 
+instance SyscallExitFormatting SyscallExitDetails_stat where
+  syscallExitToFormatted SyscallExitDetails_stat { enterDetail, stat } =
+    ( FormattedSyscall "stat" [formatArg pathnameBS, formatArg stat]
+    , NoReturn
+    )
+    where
+      SyscallEnterDetails_stat{ pathnameBS } = enterDetail
+
 
 data SyscallEnterDetails_fstat = SyscallEnterDetails_fstat
   { fd :: CInt
   , statbuf :: Ptr StatStruct
   } deriving (Eq, Ord, Show)
+
+instance SyscallEnterFormatting SyscallEnterDetails_fstat where
+  syscallEnterToFormatted SyscallEnterDetails_fstat{ fd } =
+    FormattedSyscall "fstat" [formatArg fd, argPlaceholder "*statbuf"]
 
 
 data SyscallExitDetails_fstat = SyscallExitDetails_fstat
@@ -589,6 +759,14 @@ data SyscallExitDetails_fstat = SyscallExitDetails_fstat
   -- Peeked details
   , stat :: StatStruct
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_fstat where
+  syscallExitToFormatted SyscallExitDetails_fstat{ enterDetail, stat } =
+    ( FormattedSyscall "fstat" [formatArg fd, formatArg stat]
+    , NoReturn
+    )
+    where
+      SyscallEnterDetails_fstat{ fd } = enterDetail
 
 
 data SyscallEnterDetails_lstat = SyscallEnterDetails_lstat
@@ -598,12 +776,24 @@ data SyscallEnterDetails_lstat = SyscallEnterDetails_lstat
   , pathnameBS :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_lstat where
+  syscallEnterToFormatted SyscallEnterDetails_lstat{ pathnameBS } =
+    FormattedSyscall "lstat" [formatArg pathnameBS, argPlaceholder "*statbuf"]
+
 
 data SyscallExitDetails_lstat = SyscallExitDetails_lstat
   { enterDetail :: SyscallEnterDetails_lstat
   -- Peeked details
   , stat :: StatStruct
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_lstat where
+  syscallExitToFormatted SyscallExitDetails_lstat{ enterDetail, stat } =
+    ( FormattedSyscall "lstat" [formatArg pathnameBS, formatArg stat]
+    , NoReturn
+    )
+    where
+      SyscallEnterDetails_lstat{ pathnameBS } = enterDetail
 
 
 data SyscallEnterDetails_newfstatat = SyscallEnterDetails_newfstatat
@@ -615,12 +805,28 @@ data SyscallEnterDetails_newfstatat = SyscallEnterDetails_newfstatat
   , pathnameBS :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_newfstatat where
+  syscallEnterToFormatted SyscallEnterDetails_newfstatat{ dirfd, pathnameBS, flags } =
+    FormattedSyscall "newfstatat" [ formatArg dirfd, formatArg pathnameBS
+                                  , argPlaceholder "*statbuf", formatArg flags
+                                  ]
+
 
 data SyscallExitDetails_newfstatat = SyscallExitDetails_newfstatat
   { enterDetail :: SyscallEnterDetails_newfstatat
   -- Peeked details
   , stat :: StatStruct
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_newfstatat where
+  syscallExitToFormatted SyscallExitDetails_newfstatat{ enterDetail, stat } =
+    ( FormattedSyscall "newfstatat" [ formatArg dirfd, formatArg pathnameBS
+                                    , formatArg stat, formatArg flags
+                                    ]
+    , NoReturn
+    )
+    where
+      SyscallEnterDetails_newfstatat{ dirfd, pathnameBS, flags } = enterDetail
 
 
 data SyscallEnterDetails_execve = SyscallEnterDetails_execve
@@ -633,11 +839,25 @@ data SyscallEnterDetails_execve = SyscallEnterDetails_execve
   , envpList :: [ByteString]
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_execve where
+  syscallEnterToFormatted SyscallEnterDetails_execve{ filenameBS, argvList, envpList } =
+    FormattedSyscall "execve" [formatArg filenameBS, formatArg argvList, formatArg envpList]
+
 
 data SyscallExitDetails_execve = SyscallExitDetails_execve
   { optionalEnterDetail :: Maybe SyscallEnterDetails_execve
   , execveResult :: CInt
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_execve where
+  syscallExitToFormatted SyscallExitDetails_execve { optionalEnterDetail, execveResult } =
+    (FormattedSyscall "execve" args, formatReturn execveResult)
+    where
+      args = case optionalEnterDetail of
+        Just SyscallEnterDetails_execve{ filenameBS, argvList, envpList } ->
+          [formatArg filenameBS, formatArg argvList, formatArg envpList]
+        Nothing ->
+          [argPlaceholder "TODO implement remembering arguments"]
 
 data SyscallEnterDetails_symlink = SyscallEnterDetails_symlink
   { target :: Ptr CChar
@@ -647,9 +867,18 @@ data SyscallEnterDetails_symlink = SyscallEnterDetails_symlink
   , linkpathBS :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_symlink where
+  syscallEnterToFormatted SyscallEnterDetails_symlink{ targetBS, linkpathBS } =
+    FormattedSyscall "symlink" [formatArg targetBS, formatArg linkpathBS]
+
 data SyscallExitDetails_symlink = SyscallExitDetails_symlink
   { enterDetail :: SyscallEnterDetails_symlink
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_symlink where
+  syscallExitToFormatted SyscallExitDetails_symlink { enterDetail } =
+    (syscallEnterToFormatted enterDetail, NoReturn)
+
 
 data SyscallEnterDetails_symlinkat = SyscallEnterDetails_symlinkat
   { dirfd :: CInt
@@ -660,40 +889,74 @@ data SyscallEnterDetails_symlinkat = SyscallEnterDetails_symlinkat
   , linkpathBS :: ByteString
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_symlinkat where
+  syscallEnterToFormatted SyscallEnterDetails_symlinkat{ targetBS, dirfd, linkpathBS } =
+    FormattedSyscall "symlinkat" [formatArg targetBS, formatArg dirfd, formatArg linkpathBS]
+
+
 data SyscallExitDetails_symlinkat = SyscallExitDetails_symlinkat
   { enterDetail :: SyscallEnterDetails_symlinkat
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_symlinkat where
+  syscallExitToFormatted SyscallExitDetails_symlinkat { enterDetail } =
+    (syscallEnterToFormatted enterDetail, NoReturn)
+
 
 data SyscallEnterDetails_time = SyscallEnterDetails_time
   { tloc :: Ptr CTime
   } deriving (Eq, Ord, Show)
 
+instance SyscallEnterFormatting SyscallEnterDetails_time where
+  syscallEnterToFormatted SyscallEnterDetails_time{ tloc } =
+    FormattedSyscall "time" [formatPtrArg "time_t" tloc]
+
 
 data SyscallExitDetails_time = SyscallExitDetails_time
   { enterDetail :: SyscallEnterDetails_time
-  , timeResult :: CTime
   -- Peeked details
-  , tlocValue :: Maybe CTime
+  , timeResult :: CTime
   } deriving (Eq, Ord, Show)
+
+-- TODO: add formatted time output (like strace does), along with a pointer
+instance SyscallExitFormatting SyscallExitDetails_time where
+  syscallExitToFormatted SyscallExitDetails_time { enterDetail, timeResult } =
+    (syscallEnterToFormatted enterDetail, formatReturn timeResult)
 
 
 data SyscallEnterDetails_mmap = SyscallEnterDetails_mmap
-  { address :: Ptr Void
+  { addr :: Ptr Void
   , len :: CSize
   , prot :: MemoryProtectMode
   , flags :: MMapMode
-  , fd :: Int
+  , fd :: CInt
   , offset :: CSize
   } deriving (Eq, Ord, Show)
+
+instance SyscallEnterFormatting SyscallEnterDetails_mmap where
+  syscallEnterToFormatted SyscallEnterDetails_mmap{ addr, len, prot, flags, fd, offset } =
+    FormattedSyscall "mmap" [ formatArg addr, formatArg len, formatArg prot
+                            , formatArg flags, formatArg fd, formatArg offset
+                            ]
+
 
 data SyscallExitDetails_mmap = SyscallExitDetails_mmap
   { enterDetail :: SyscallEnterDetails_mmap
   , mappedArea :: Ptr Void
   } deriving (Eq, Ord, Show)
 
+instance SyscallExitFormatting SyscallExitDetails_mmap where
+  syscallExitToFormatted SyscallExitDetails_mmap{ enterDetail, mappedArea } =
+    (syscallEnterToFormatted enterDetail, formatReturn mappedArea)
+
+
 data SyscallEnterDetails_brk = SyscallEnterDetails_brk
   { addr :: Ptr Void
   } deriving (Eq, Ord, Show)
+
+instance SyscallEnterFormatting SyscallEnterDetails_brk where
+  syscallEnterToFormatted SyscallEnterDetails_brk{ addr } =
+    FormattedSyscall "brk" [formatArg addr]
 
 
 data SyscallExitDetails_brk = SyscallExitDetails_brk
@@ -707,6 +970,66 @@ data SyscallExitDetails_brk = SyscallExitDetails_brk
   -- -1 return values described above.
   , brkResult :: Ptr Void
   } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_brk where
+  syscallExitToFormatted SyscallExitDetails_brk{ enterDetail, brkResult } =
+    (syscallEnterToFormatted enterDetail, formatReturn brkResult)
+
+
+data ArchPrctlAddrArg
+  = ArchPrctlAddrArgVal CULong
+  | ArchPrctlAddrArgPtr (Ptr CULong)
+  | ArchPrctlAddrArgUnknown CULong
+  deriving (Eq, Ord, Show)
+
+instance ArgFormatting ArchPrctlAddrArg where
+  formatArg (ArchPrctlAddrArgVal val) = formatArg val
+  formatArg (ArchPrctlAddrArgPtr ptr) = formatPtrArg "unsigned long" ptr
+  formatArg (ArchPrctlAddrArgUnknown val) = formatArg val
+
+data SyscallEnterDetails_arch_prctl = SyscallEnterDetails_arch_prctl
+  { code :: CInt
+  , addr :: ArchPrctlAddrArg
+  -- peeked details
+  , subfunction :: ArchPrctlSubfunction
+  } deriving (Eq, Ord, Show)
+
+instance SyscallEnterFormatting SyscallEnterDetails_arch_prctl where
+  syscallEnterToFormatted SyscallEnterDetails_arch_prctl{ subfunction, addr } =
+    FormattedSyscall "arch_prctl" [formatArg subfunction, formatArg addr]
+
+
+data SyscallExitDetails_arch_prctl = SyscallExitDetails_arch_prctl
+  { enterDetail :: SyscallEnterDetails_arch_prctl
+  -- peeked details
+  , addrValue :: CULong
+  } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_arch_prctl where
+  syscallExitToFormatted SyscallExitDetails_arch_prctl{ enterDetail, addrValue } =
+    ( FormattedSyscall "arch_prctl" [formatArg subfunction, formatArg addrValue]
+    , NoReturn)
+    where
+      SyscallEnterDetails_arch_prctl{ subfunction } = enterDetail
+
+data SyscallEnterDetails_set_tid_address = SyscallEnterDetails_set_tid_address
+  { tidptr :: Ptr CInt
+  } deriving (Eq, Ord, Show)
+
+instance SyscallEnterFormatting SyscallEnterDetails_set_tid_address where
+  syscallEnterToFormatted SyscallEnterDetails_set_tid_address{ tidptr } =
+    FormattedSyscall "set_tid_address" [formatPtrArg "int" tidptr]
+
+
+data SyscallExitDetails_set_tid_address = SyscallExitDetails_set_tid_address
+  { enterDetail :: SyscallEnterDetails_set_tid_address
+  -- peeked details
+  , tidResult :: CLong
+  } deriving (Eq, Ord, Show)
+
+instance SyscallExitFormatting SyscallExitDetails_set_tid_address where
+  syscallExitToFormatted SyscallExitDetails_set_tid_address{ enterDetail, tidResult } =
+    ( syscallEnterToFormatted enterDetail, formatReturn tidResult )
 
 
 data DetailedSyscallEnter
@@ -735,6 +1058,8 @@ data DetailedSyscallEnter
   | DetailedSyscallEnter_symlinkat SyscallEnterDetails_symlinkat
   | DetailedSyscallEnter_time SyscallEnterDetails_time
   | DetailedSyscallEnter_brk SyscallEnterDetails_brk
+  | DetailedSyscallEnter_arch_prctl SyscallEnterDetails_arch_prctl
+  | DetailedSyscallEnter_set_tid_address SyscallEnterDetails_set_tid_address
   | DetailedSyscallEnter_unimplemented Syscall SyscallArgs
   deriving (Eq, Ord, Show)
 
@@ -765,6 +1090,8 @@ data DetailedSyscallExit
   | DetailedSyscallExit_symlinkat SyscallExitDetails_symlinkat
   | DetailedSyscallExit_time SyscallExitDetails_time
   | DetailedSyscallExit_brk SyscallExitDetails_brk
+  | DetailedSyscallExit_arch_prctl SyscallExitDetails_arch_prctl
+  | DetailedSyscallExit_set_tid_address SyscallExitDetails_set_tid_address
   | DetailedSyscallExit_unimplemented Syscall SyscallArgs Word64
   deriving (Eq, Ord, Show)
 
@@ -986,7 +1313,7 @@ getSyscallEnterDetails syscall syscallArgs pid = let proc = TracedProcess pid in
     let SyscallArgs{ arg0 = addr, arg1 = len, arg2 = prot, arg3 = flags, arg4 = fd, arg5 = offset } = syscallArgs
     let addrPtr = word64ToPtr addr
     pure $ DetailedSyscallEnter_mmap $ SyscallEnterDetails_mmap
-      { address = addrPtr
+      { addr = addrPtr
       , len = fromIntegral len
       , prot = fromCInt $ fromIntegral prot
       , flags = fromCInt $ fromIntegral flags
@@ -1028,6 +1355,29 @@ getSyscallEnterDetails syscall syscallArgs pid = let proc = TracedProcess pid in
     let SyscallArgs{ arg0 = addr } = syscallArgs
     let addrPtr = word64ToPtr addr
     pure $ DetailedSyscallEnter_brk $ SyscallEnterDetails_brk { addr = addrPtr }
+  Syscall_arch_prctl -> do
+    let SyscallArgs{ arg0 = codeWord, arg1 = addrUnion } = syscallArgs
+    let code = fromIntegral codeWord
+    let subfunction = fromCInt (fromIntegral code)
+    let addrArg =
+          if
+            | subfunction == ArchSetFs || subfunction == ArchSetGs ->
+              ArchPrctlAddrArgVal $ fromIntegral addrUnion
+            | subfunction == ArchGetFs || subfunction == ArchGetGs ->
+              ArchPrctlAddrArgPtr $ word64ToPtr addrUnion
+            | otherwise ->
+              ArchPrctlAddrArgUnknown $ fromIntegral addrUnion
+    pure $ DetailedSyscallEnter_arch_prctl $ SyscallEnterDetails_arch_prctl
+      { code
+      , addr = addrArg
+      , subfunction
+      }
+  Syscall_set_tid_address -> do
+    let SyscallArgs{ arg0 = pidAddr } = syscallArgs
+    let tidptr = word64ToPtr pidAddr
+    pure $ DetailedSyscallEnter_set_tid_address $ SyscallEnterDetails_set_tid_address
+      { tidptr
+      } 
   _ -> pure $ DetailedSyscallEnter_unimplemented (KnownSyscall syscall) syscallArgs
 
 
@@ -1038,12 +1388,15 @@ getSyscallExitDetails knownSyscall syscallArgs pid = do
 
   case mbErrno of
     Just errno -> return $ Left errno
-    Nothing -> Right <$> do
-
+    Nothing ->
       -- For some syscalls we must not try to get the enter details at their exit,
       -- because the registers involved are invalidated.
       -- TODO: Address this by not re-fetching the enter details at all, but by
       --       remembering them in a PID map.
+      Right <$> getSyscallExitDetails' knownSyscall syscallArgs result pid
+
+getSyscallExitDetails' :: KnownSyscall -> SyscallArgs -> Word64 -> CPid -> IO DetailedSyscallExit
+getSyscallExitDetails' knownSyscall syscallArgs result pid =
       case knownSyscall of
         Syscall_execve | result == 0 -> do
           -- The execve() worked, we cannot get its enter details, as the
@@ -1179,19 +1532,35 @@ getSyscallExitDetails knownSyscall syscallArgs pid = do
                   SyscallExitDetails_symlinkat{ enterDetail }
 
             DetailedSyscallEnter_time
-              enterDetail@SyscallEnterDetails_time{tloc} -> do
-                tlocValue <- if tloc == nullPtr
-                             then pure Nothing
-                             else Just <$> peek (TracedProcess pid) tloc
+              enterDetail@SyscallEnterDetails_time{} -> do
                 pure $ DetailedSyscallExit_time $
                   SyscallExitDetails_time
                     { enterDetail
                     , timeResult = fromIntegral result
-                    , tlocValue
                     }
             DetailedSyscallEnter_brk
               enterDetail@SyscallEnterDetails_brk{} -> do
-                pure $ DetailedSyscallExit_brk $ SyscallExitDetails_brk{ enterDetail, brkResult = word64ToPtr result }
+                pure $ DetailedSyscallExit_brk $
+                  SyscallExitDetails_brk{ enterDetail, brkResult = word64ToPtr result }
+
+            DetailedSyscallEnter_arch_prctl
+              enterDetail@SyscallEnterDetails_arch_prctl{ addr } -> do
+                addrValue <- case addr of
+                  ArchPrctlAddrArgVal value -> pure value
+                  ArchPrctlAddrArgPtr ptr -> peek (TracedProcess pid) ptr
+                  -- this shouldn't happen so we don't want to complicate
+                  -- the types because of this improbable scenario
+                  ArchPrctlAddrArgUnknown _ -> pure 0
+                pure $ DetailedSyscallExit_arch_prctl $
+                  SyscallExitDetails_arch_prctl{ enterDetail, addrValue }
+
+            DetailedSyscallEnter_set_tid_address
+              enterDetail@SyscallEnterDetails_set_tid_address{ } -> do
+                pure $ DetailedSyscallExit_set_tid_address $
+                  SyscallExitDetails_set_tid_address
+                    { enterDetail
+                    , tidResult = fromIntegral result
+                    }
 
             DetailedSyscallEnter_unimplemented syscall _syscallArgs ->
               pure $ DetailedSyscallExit_unimplemented syscall syscallArgs result
@@ -1221,273 +1590,11 @@ syscallExitDetailsOnlyConduit = awaitForever $ \(pid, event) -> case event of
   _ -> return () -- skip
 
 
-formatDetailedSyscallEnter :: DetailedSyscallEnter -> String
-formatDetailedSyscallEnter = \case
-
-  DetailedSyscallEnter_open
-    SyscallEnterDetails_open{ pathnameBS, flags, mode } ->
-      "open(" ++ show pathnameBS ++ ", " ++ show flags ++ ", " ++ show mode ++ ")"
-
-  DetailedSyscallEnter_openat
-    SyscallEnterDetails_openat{ dirfd, pathnameBS, flags, mode } ->
-      "openat(" ++ show dirfd ++ ", " ++ show pathnameBS ++ ", " ++ show flags ++ ", " ++ show mode ++ ")"
-
-  DetailedSyscallEnter_creat
-    SyscallEnterDetails_creat{ pathnameBS, mode } ->
-      "creat(" ++ show pathnameBS ++ ", " ++ show mode ++ ")"
-
-  DetailedSyscallEnter_pipe
-    SyscallEnterDetails_pipe{ } ->
-      "pipe([])"
-
-  DetailedSyscallEnter_pipe2
-    SyscallEnterDetails_pipe2{ flags } ->
-      "pipe([], " ++ show flags ++ ")"
-
-  DetailedSyscallEnter_access
-    SyscallEnterDetails_access{ pathnameBS, accessMode } ->
-      "access(" ++ show pathnameBS ++ ", " ++ hShow accessMode ++ ")"
-
-  DetailedSyscallEnter_faccessat
-    SyscallEnterDetails_faccessat{ dirfd, pathnameBS, accessMode, flags } ->
-      "faccessat(" ++ show dirfd ++ ", " ++ show pathnameBS ++ ", " ++ hShow accessMode ++ ", " ++ show flags ++")"
-
-  DetailedSyscallEnter_write
-    SyscallEnterDetails_write{ fd, bufContents, count } ->
-      "write(" ++ show fd ++ ", " ++ show bufContents ++ ", " ++ show count ++ ")"
-
-  DetailedSyscallEnter_read
-    SyscallEnterDetails_read{ fd, count } ->
-      "read(" ++ show fd ++ ", void *buf, " ++ show count ++ ")"
-
-  DetailedSyscallEnter_close
-    SyscallEnterDetails_close{ fd } ->
-      "close(" ++ show fd ++ ")"
-
-  DetailedSyscallEnter_rename
-    SyscallEnterDetails_rename{ oldpathBS, newpathBS } ->
-      "rename(" ++ show oldpathBS ++ ", " ++ show newpathBS ++ ")"
-
-  DetailedSyscallEnter_renameat
-    SyscallEnterDetails_renameat{ olddirfd, oldpathBS, newdirfd, newpathBS } ->
-      "renameat(" ++ show olddirfd ++ ", " ++ show oldpathBS ++
-                ", " ++ show newdirfd ++ ", " ++ show newpathBS ++ ")"
-
-  DetailedSyscallEnter_renameat2
-    SyscallEnterDetails_renameat2{ olddirfd, oldpathBS, newdirfd, newpathBS, flags } ->
-      "renameat2(" ++ show olddirfd ++ ", " ++ show oldpathBS ++
-                 ", " ++ show newdirfd ++ ", " ++ show newpathBS ++ ", " ++ show flags ++ ")"
-
-  DetailedSyscallEnter_stat
-    SyscallEnterDetails_stat{ pathnameBS } ->
-      "stat(" ++ show pathnameBS ++ ", struct stat *statbuf)"
-
-  DetailedSyscallEnter_fstat
-    SyscallEnterDetails_fstat{ fd } ->
-      "fstat(" ++ show fd ++ ", struct stat *statbuf)"
-
-  DetailedSyscallEnter_lstat
-    SyscallEnterDetails_lstat{ pathnameBS } ->
-      "lstat(" ++ show pathnameBS ++ ", struct stat *statbuf)"
-
-  DetailedSyscallEnter_newfstatat
-    SyscallEnterDetails_newfstatat{ dirfd, pathnameBS, flags } ->
-      "newfstatat(" ++ show dirfd ++ ", " ++ show pathnameBS ++ ", struct stat *statbuf, " ++ show flags ++ ")"
-
-  DetailedSyscallEnter_execve
-    SyscallEnterDetails_execve{ filenameBS, argvList, envpList } ->
-      "execve(" ++ show filenameBS ++ ", " ++ show argvList ++ ", " ++ show envpList ++ ")"
-
-  DetailedSyscallEnter_exit
-    SyscallEnterDetails_exit{ status } ->
-      "exit(" ++ show status ++ ")"
-
-  DetailedSyscallEnter_exit_group
-    SyscallEnterDetails_exit_group{ status } ->
-      "exit_group(" ++ show status ++ ")"
-
-  DetailedSyscallEnter_mmap
-    SyscallEnterDetails_mmap{ address, len, prot, flags, fd, offset } ->
-      "mmap(" ++ show address ++ ", " ++ show len ++ ", " ++ hShow prot ++ ", " ++ hShow flags ++ ", " ++ show fd ++ ", " ++ show offset ++ ")"
-
-  DetailedSyscallEnter_symlink
-    SyscallEnterDetails_symlink{ targetBS, linkpathBS } ->
-      "symlink(" ++ show targetBS ++ ", " ++ show linkpathBS ++ ")"
-
-  DetailedSyscallEnter_symlinkat
-    SyscallEnterDetails_symlinkat{ targetBS, dirfd, linkpathBS } ->
-      "symlinkat(" ++ show targetBS ++ ", " ++ show dirfd ++ ", " ++ show linkpathBS ++ ")"
-
-  DetailedSyscallEnter_time
-    SyscallEnterDetails_time{ tloc } ->
-      "time(" ++ show tloc ++ ")"
-  DetailedSyscallEnter_brk
-    SyscallEnterDetails_brk{ addr } ->
-      "brk(" ++ showPtrOrNull addr ++ ")"
-
-  DetailedSyscallEnter_unimplemented syscall syscallArgs ->
-    "unimplemented_syscall_details(" ++ show syscall ++ ", " ++ show syscallArgs ++ ")"
-
-
 foreign import ccall unsafe "string.h strerror" c_strerror :: CInt -> IO (Ptr CChar)
 
 -- | Like "Foreign.C.Error"'s @errnoToIOError@, but getting only the string.
 strError :: ERRNO -> IO String
 strError (ERRNO errno) = c_strerror errno >>= peekCString
-
-
-showPtrOrNull :: Ptr a -> String
-showPtrOrNull p
-  | p == nullPtr = "NULL"
-  | otherwise    = show p
-
-
-formatDetailedSyscallExit :: DetailedSyscallExit -> String
-formatDetailedSyscallExit = \case
-
-  DetailedSyscallExit_open
-    SyscallExitDetails_open{ enterDetail = SyscallEnterDetails_open{ pathnameBS, flags, mode }, fd } ->
-      "open(" ++ show pathnameBS ++ ", " ++ show flags ++ ", " ++ show mode ++ ") = " ++ show fd
-
-  DetailedSyscallExit_openat
-    SyscallExitDetails_openat{ enterDetail = SyscallEnterDetails_openat{ dirfd, pathnameBS, flags, mode }, fd } ->
-      "openat(" ++ show dirfd ++ ", " ++ show pathnameBS ++ ", " ++ show flags ++ ", " ++ show mode ++ ") = " ++ show fd
-
-  DetailedSyscallExit_creat
-    SyscallExitDetails_creat{ enterDetail = SyscallEnterDetails_creat{ pathnameBS, mode }, fd } ->
-      "creat(" ++ show pathnameBS ++ ", " ++ show mode ++ ") = " ++ show fd
-
-  DetailedSyscallExit_pipe
-    SyscallExitDetails_pipe{ enterDetail = SyscallEnterDetails_pipe{}, readfd, writefd } ->
-      "pipe([" ++ show readfd ++ ", " ++ show writefd ++ "])"
-
-  DetailedSyscallExit_pipe2
-    SyscallExitDetails_pipe2{ enterDetail = SyscallEnterDetails_pipe2{ flags }, readfd, writefd } ->
-      "pipe([" ++ show readfd ++ ", " ++ show writefd ++ "], " ++ show flags ++ ")"
-
-  DetailedSyscallExit_access
-    SyscallExitDetails_access{ enterDetail = SyscallEnterDetails_access{ pathnameBS, accessMode } } ->
-      "access(" ++ show pathnameBS ++ ", " ++ hShow accessMode ++ ")"
-
-  DetailedSyscallExit_faccessat
-    SyscallExitDetails_faccessat
-    { enterDetail = SyscallEnterDetails_faccessat{ dirfd, pathnameBS, accessMode, flags } } ->
-      "faccessat(" ++ show dirfd ++ ", " ++ show pathnameBS ++ ", " ++ hShow accessMode ++ ", " ++ show flags ++ ")"
-
-  DetailedSyscallExit_write
-    SyscallExitDetails_write{ enterDetail = SyscallEnterDetails_write{ fd, bufContents, count }, writtenCount } ->
-      "write(" ++ show fd ++ ", " ++ show bufContents ++ ", " ++ show count ++ ") = " ++ show writtenCount
-
-  DetailedSyscallExit_read
-    SyscallExitDetails_read{ enterDetail = SyscallEnterDetails_read{ fd, count }, readCount, bufContents } ->
-      "read(" ++ show fd ++ ", " ++ show bufContents ++ ", " ++ show count ++ ") = " ++ show readCount
-
-  DetailedSyscallExit_close
-    SyscallExitDetails_close{ enterDetail = SyscallEnterDetails_close{ fd } } ->
-      "close(" ++ show fd ++ ")"
-
-  DetailedSyscallExit_rename
-    SyscallExitDetails_rename{ enterDetail = SyscallEnterDetails_rename{ oldpathBS, newpathBS } } ->
-      "rename(" ++ show oldpathBS ++ ", " ++ show newpathBS ++ ")"
-
-  DetailedSyscallExit_renameat
-    SyscallExitDetails_renameat
-    { enterDetail = SyscallEnterDetails_renameat{ olddirfd, oldpathBS, newdirfd, newpathBS } } ->
-      "renameat(" ++ show olddirfd ++ ", " ++ show oldpathBS ++
-                ", " ++ show newdirfd ++ ", " ++ show newpathBS ++ ")"
-
-  DetailedSyscallExit_renameat2
-    SyscallExitDetails_renameat2
-    { enterDetail = SyscallEnterDetails_renameat2{ olddirfd, oldpathBS, newdirfd, newpathBS, flags } } ->
-      "renameat2(" ++ show olddirfd ++ ", " ++ show oldpathBS ++
-                 ", " ++ show newdirfd ++ ", " ++ show newpathBS ++ ", " ++ show flags ++ ")"
-
-  DetailedSyscallExit_stat
-    SyscallExitDetails_stat{ enterDetail = SyscallEnterDetails_stat{ pathnameBS }, stat } ->
-      "stat(" ++ show pathnameBS ++ ", " ++ hShow stat ++ ")"
-
-  DetailedSyscallExit_fstat
-    SyscallExitDetails_fstat{ enterDetail = SyscallEnterDetails_fstat{ fd }, stat } ->
-      "fstat(" ++ show fd ++ ", " ++ hShow stat ++ ")"
-
-  DetailedSyscallExit_lstat
-    SyscallExitDetails_lstat{ enterDetail = SyscallEnterDetails_lstat{ pathnameBS }, stat } ->
-      "lstat(" ++ show pathnameBS ++ ", " ++ hShow stat ++ ")"
-
-  DetailedSyscallExit_newfstatat
-    SyscallExitDetails_newfstatat{ enterDetail = SyscallEnterDetails_newfstatat{ dirfd, pathnameBS, flags }, stat } ->
-      "newfstatat(" ++ show dirfd ++ ", " ++ show pathnameBS ++ ", " ++ hShow stat ++ ", " ++ show flags ++ ")"
-
-  DetailedSyscallExit_execve
-    SyscallExitDetails_execve{ optionalEnterDetail, execveResult } ->
-      -- TODO implement remembering arguments
-      let arguments = case optionalEnterDetail of
-            Just SyscallEnterDetails_execve{ filenameBS, argvList, envpList } ->
-              show filenameBS ++ ", " ++ show argvList ++ ", " ++ show envpList
-            Nothing -> "TODO implement remembering arguments"
-      in "execve(" ++ arguments ++ ") = " ++ show execveResult
-
-  DetailedSyscallExit_exit
-    SyscallExitDetails_exit{ enterDetail = SyscallEnterDetails_exit{ status }} ->
-      "exit(" ++ show status ++ ")"
-
-  DetailedSyscallExit_exit_group
-    SyscallExitDetails_exit_group{ enterDetail = SyscallEnterDetails_exit_group{ status }} ->
-      "exit_group(" ++ show status ++ ")"
-
-  DetailedSyscallExit_mmap
-    SyscallExitDetails_mmap{ enterDetail = SyscallEnterDetails_mmap{ address, len, prot, flags, fd, offset }, mappedArea} ->
-      "mmap(" ++ show address ++ ", " ++ show len ++ ", " ++ hShow prot ++ ", " ++ hShow flags ++ ", " ++ show fd ++ ", " ++ show offset ++ ") = " ++ show mappedArea
-
-  DetailedSyscallExit_symlink
-    SyscallExitDetails_symlink{ enterDetail = SyscallEnterDetails_symlink{ targetBS, linkpathBS }} ->
-      "symlink(" ++ show targetBS ++ ", " ++ show linkpathBS ++ ")"
-
-  DetailedSyscallExit_symlinkat
-    SyscallExitDetails_symlinkat{ enterDetail = SyscallEnterDetails_symlinkat{ targetBS, dirfd, linkpathBS }} ->
-      "symlinkat(" ++ show targetBS ++ ", " ++ show dirfd ++ ", " ++ show linkpathBS ++ ")"
-
-  DetailedSyscallExit_time
-    SyscallExitDetails_time{ enterDetail = SyscallEnterDetails_time { tloc }
-                           , timeResult
-                           , tlocValue
-                           } ->
-      "time(" ++ show tloc ++ " /* " ++ show tlocValue ++ " */) = " ++ show timeResult
-
-  DetailedSyscallExit_brk
-    SyscallExitDetails_brk{ enterDetail = SyscallEnterDetails_brk{ addr }, brkResult} ->
-      "brk(" ++ showPtrOrNull addr ++ ") = " ++ show brkResult
-
-  DetailedSyscallExit_unimplemented syscall syscallArgs result ->
-    "unimplemented_syscall_details(" ++ show syscall ++ ", " ++ show syscallArgs ++ ") = " ++ show result
-
-
-getFormattedSyscallEnterDetails :: Syscall -> SyscallArgs -> CPid -> IO String
-getFormattedSyscallEnterDetails syscall syscallArgs pid =
-  case syscall of
-    UnknownSyscall number -> do
-      pure $ "unknown_syscall_" ++ show number ++ "(" ++ show syscallArgs ++ ")"
-    KnownSyscall knownSyscall -> do
-      detailed <- getSyscallEnterDetails knownSyscall syscallArgs pid
-      pure $ formatDetailedSyscallEnter detailed
-
-
-getFormattedSyscallExitDetails :: Syscall -> SyscallArgs -> CPid -> IO String
-getFormattedSyscallExitDetails syscall syscallArgs pid =
-  case syscall of
-    UnknownSyscall number -> do
-      pure $ "unknown_syscall_" ++ show number ++ "(" ++ show syscallArgs ++ ")"
-    KnownSyscall knownSyscall -> do
-
-      eDetailed <- getSyscallExitDetails knownSyscall syscallArgs pid
-
-      case eDetailed of
-        Right detailedExit -> pure $ formatDetailedSyscallExit detailedExit
-        Left errno -> do
-          strErr <- strError errno
-          let formattedErrno = " (" ++ strErr ++ ")"
-          -- TODO implement remembering arguments
-          pure $ syscallName knownSyscall ++ "(TODO implement remembering arguments) = -1" ++ formattedErrno
 
 
 -- TODO Make a version of this that takes a CreateProcess.
@@ -1496,12 +1603,13 @@ getFormattedSyscallExitDetails syscall syscallArgs pid =
 --      It uses PTHREAD_ATTACH, which sends SIGSTOP to the started
 --      process. By that time, the process may already have exited.
 
-traceForkExecvFullPath :: [String] -> IO ExitCode
-traceForkExecvFullPath args = do
-  (exitCode, ()) <-
-    sourceTraceForkExecvFullPathWithSink args (printSyscallOrSignalNameConduit .| CL.sinkNull)
-  return exitCode
+traceForkExecvFullPath :: [String] -> (HatraceEvent -> IO ()) -> IO ExitCode
+traceForkExecvFullPath args printer = do
+  let formattingSink = formatHatraceEventConduit .| CL.mapM printer .| CL.sinkNull
 
+  (exitCode, ()) <-
+    sourceTraceForkExecvFullPathWithSink args formattingSink
+  return exitCode
 
 -- | Like the partial `T.decodeUtf8`, with `HasCallStack`.
 decodeUtf8OrError :: (HasCallStack) => ByteString -> Text
@@ -1657,36 +1765,294 @@ atomicWritesSink =
       AtomicWrite target -> Right (target, src)
       other -> Left (src, other)
 
--- | Passes through all syscalls and signals that come by,
--- printing them, including details where available.
-printSyscallOrSignalNameConduit :: (MonadIO m) => ConduitT (CPid, TraceEvent) (CPid, TraceEvent) m ()
-printSyscallOrSignalNameConduit = CL.iterM $ \(pid, event) -> do
-  liftIO $ case event of
+data HatraceEvent = HatraceEvent CPid EventDetails
+  deriving (Eq, Ord, Show)
+
+data EventDetails
+  = EventSyscallEnter EventSyscallEnterDetails
+  | EventSyscallExit EventSyscallExitDetails
+  | EventPTraceEvent PTRACE_EVENT
+  | EventGroupStop Signal
+  | EventSignalDelivery Signal
+  | EventProcessDeath ExitCode
+  deriving (Eq, Ord, Show)
+
+data EventSyscallEnterDetails = EventSyscallEnterDetails
+  { evEnterSyscall :: Syscall
+  , evEnterFormatted :: FormattedSyscall
+  } deriving (Eq, Ord, Show)
+
+instance ToJSON EventSyscallEnterDetails where
+  toJSON = toJSON . evEnterFormatted
+
+data EventSyscallExitDetails = EventSyscallExitDetails
+  { evExitSyscall ::  Syscall
+  , evExitFormatted :: FormattedSyscall
+  , evExitOutcome :: ReturnOrErrno
+  } deriving (Eq, Ord, Show)
+
+instance ToJSON EventSyscallExitDetails where
+  toJSON details = object [ "syscall" .= evExitFormatted details
+                          , "outcome" .= evExitOutcome details
+                          ]
+
+instance ToJSON HatraceEvent where
+  toJSON (HatraceEvent pid details) =
+    case details of
+      EventSyscallEnter enterDetails -> formatDetails "syscall_enter" enterDetails
+      EventSyscallExit exitDetails -> formatDetails "syscall_exit" exitDetails
+      EventPTraceEvent ptraceEvent -> formatDetails "ptrace_event" ptraceEvent
+      EventGroupStop signal -> formatDetails "group_stop" (signalToJSON signal)
+      EventSignalDelivery signal -> formatDetails "signal_delivery" (signalToJSON signal)
+      EventProcessDeath exitCode -> formatDetails "process_death" (exitCodeToJSON exitCode)
+    where
+      formatDetails eventType eventDetails =
+        object [ "pid" .= toInteger pid, eventType .= eventDetails ]
+      -- TODO: we need use better type than unix's barebone Signal equal to CInt
+      signalToJSON = show
+      -- TODO: use something better
+      exitCodeToJSON = show
+
+data ReturnOrErrno
+  = ProperReturn FormattedReturn
+  | ErrnoResult ERRNO String
+  deriving (Eq, Ord, Show)
+
+instance ToJSON ReturnOrErrno where
+  toJSON (ProperReturn r) = object [ "return" .= r ]
+  toJSON (ErrnoResult (ERRNO errno) descr) =
+    object [ "error" .= object [ "errno" .= toInteger errno
+                               , "description" .= descr
+                               ]
+           ]
+
+formatHatraceEventConduit :: (MonadIO m) => ConduitT (CPid, TraceEvent) HatraceEvent m ()
+formatHatraceEventConduit = CL.mapM $ \(pid, event) -> do
+  case event of
 
     SyscallStop enterOrExit -> case enterOrExit of
 
       SyscallEnter (syscall, syscallArgs) -> do
-        formatted <- getFormattedSyscallEnterDetails syscall syscallArgs pid
-        putStrLn $ show [pid] ++ " Entering syscall: " ++ show syscall
-          ++ (if formatted /= "" then ", details: " ++ formatted else "")
+        formatted <- liftIO $ formatSyscallEnter syscall syscallArgs pid
+        return $ HatraceEvent pid (EventSyscallEnter $ EventSyscallEnterDetails syscall formatted)
 
       SyscallExit (syscall, syscallArgs) -> do
-        formatted <- getFormattedSyscallExitDetails syscall syscallArgs pid
-        putStrLn $ show [pid] ++ " Exited syscall: " ++ show syscall
-          ++ (if formatted /= "" then ", details: " ++ formatted else "")
+        (formatted, outcome) <- liftIO $ formatSyscallExit syscall syscallArgs pid
+        return $ HatraceEvent pid (EventSyscallExit $ EventSyscallExitDetails syscall formatted outcome)
 
-    PTRACE_EVENT_Stop ptraceEvent -> do
-      putStrLn $ show [pid] ++ " Got event: " ++ show ptraceEvent
+    PTRACE_EVENT_Stop ptraceEvent ->
+      return $ HatraceEvent pid (EventPTraceEvent ptraceEvent)
 
-    GroupStop sig -> do
-      putStrLn $ show [pid] ++ " Got group stop: " ++ prettySignal sig
+    GroupStop sig ->
+      return $ HatraceEvent pid (EventGroupStop sig)
 
-    SignalDeliveryStop sig -> do
-      putStrLn $ show [pid] ++ " Got signal: " ++ prettySignal sig
+    SignalDeliveryStop sig ->
+      return $ HatraceEvent pid (EventSignalDelivery sig)
 
-    Death fullStatus -> do
-      putStrLn $ show [pid] ++ " Process exited with status: " ++ show fullStatus
+    Death fullStatus ->
+      return $ HatraceEvent pid (EventProcessDeath fullStatus)
 
+printHatraceEvent :: StringFormattingOptions -> HatraceEvent -> IO ()
+printHatraceEvent formattingOptions (HatraceEvent pid details) = do
+  putStr $ show [pid] ++ " "
+  case details of
+    EventSyscallEnter enterDetails ->
+      let syscall = evEnterSyscall enterDetails
+          formattedSyscall = evEnterFormatted enterDetails
+      in putStrLn $ "Entering syscall: " ++ show syscall ++ ", details: " ++
+           syscallToString formattingOptions formattedSyscall
+
+    EventSyscallExit exitDetails ->
+      let syscall = evExitSyscall exitDetails
+          formattedSyscall = evExitFormatted exitDetails
+          outcome = case evExitOutcome exitDetails of
+            ProperReturn formattedReturn -> formattedReturn
+            ErrnoResult _errno strErr ->
+              FormattedReturn $ FixedStringArg $ "-1 (" ++ strErr ++ ")"
+      in putStrLn $ "Exited syscall: " ++ show syscall ++ ", details: " ++
+        syscallExitToString formattingOptions (formattedSyscall, outcome)
+
+    EventPTraceEvent ptraceEvent ->
+      putStrLn $ "Got event: " ++ show ptraceEvent
+
+    EventGroupStop sig ->
+      putStrLn $ "Got group stop: " ++ prettySignal sig
+
+    EventSignalDelivery sig ->
+      putStrLn $ "Got signal: " ++ prettySignal sig
+
+    EventProcessDeath exitCode ->
+      putStrLn $ "Process exited with status: " ++ show exitCode
+
+
+printHatraceEventJson :: HatraceEvent -> IO ()
+printHatraceEventJson hatraceEvent = do
+  BS.putStr $ BSL.toStrict $ encode hatraceEvent <> "\n"
+
+
+formatSyscallEnter :: Syscall -> SyscallArgs -> CPid -> IO FormattedSyscall
+formatSyscallEnter syscall syscallArgs pid =
+  case syscall of
+    UnknownSyscall number ->
+      pure $ FormattedSyscall ("unknown_syscall_" ++ show number) (unimplementedArgs syscallArgs)
+    KnownSyscall knownSyscall -> do
+      detailed <- getSyscallEnterDetails knownSyscall syscallArgs pid
+      pure $ case detailed of
+        DetailedSyscallEnter_open details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_openat details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_creat details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_pipe details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_pipe2 details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_access details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_faccessat details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_write details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_read details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_close details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_rename details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_renameat details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_renameat2 details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_stat details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_fstat details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_lstat details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_newfstatat details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_mmap details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_symlink details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_symlinkat details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_time details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_brk details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_arch_prctl details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_set_tid_address details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_execve details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_exit details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_exit_group details -> syscallEnterToFormatted details
+
+        DetailedSyscallEnter_unimplemented unimplementedSyscall unimplementedSyscallArgs ->
+          FormattedSyscall ("unimplemented_syscall_details(" ++ show unimplementedSyscall ++ ")")
+                           (unimplementedArgs unimplementedSyscallArgs)
+
+unimplementedArgs :: SyscallArgs -> [FormattedArg]
+unimplementedArgs args =
+  [ formatArg (argN args) | argN <- [arg0, arg1, arg2, arg3, arg4, arg5] ]
+
+formatSyscallExit :: Syscall -> SyscallArgs -> CPid -> IO (FormattedSyscall, ReturnOrErrno)
+formatSyscallExit syscall syscallArgs pid = do
+  (result, mbErrno) <- getExitedSyscallResult pid
+
+  let unknownExit name = definedArgsExit name (unimplementedArgs syscallArgs)
+      definedArgsExit name args = do
+        err <- case mbErrno of
+          Nothing -> pure $ ProperReturn NoReturn
+          Just errno -> ErrnoResult errno <$> strError errno
+        pure (FormattedSyscall name args, err)
+
+  case syscall of
+    UnknownSyscall number ->
+      unknownExit $ "unknown_syscall(" ++ show number ++ ")"
+       -- For some syscalls we must not try to get the enter details at their exit,
+       -- because the registers involved are invalidated.
+       -- TODO: Address this by not re-fetching the enter details at all, but by
+    KnownSyscall knownSyscall ->
+      case mbErrno of
+        Just _erno ->
+          definedArgsExit (syscallName knownSyscall)
+                          [ argPlaceholder "TODO implement remembering arguments" ]
+        Nothing -> do
+          details <- getSyscallExitDetails' knownSyscall syscallArgs result pid
+          formatDetailedSyscallExit details $ \_syscall _syscallArgs _result ->
+            unknownExit $ "unimplemented_syscall(" ++ show syscall ++ ")"
+
+formatDetailedSyscallExit ::
+     DetailedSyscallExit
+  -> (Syscall -> SyscallArgs -> Word64 -> IO (FormattedSyscall, ReturnOrErrno))
+  -> IO (FormattedSyscall, ReturnOrErrno)
+formatDetailedSyscallExit detailedExit handleUnimplemented =
+  case detailedExit of
+    DetailedSyscallExit_open details -> formatDetails details
+
+    DetailedSyscallExit_openat details -> formatDetails details
+
+    DetailedSyscallExit_creat details -> formatDetails details
+
+    DetailedSyscallExit_pipe details -> formatDetails details
+
+    DetailedSyscallExit_pipe2 details -> formatDetails details
+
+    DetailedSyscallExit_access details -> formatDetails details
+
+    DetailedSyscallExit_faccessat details -> formatDetails details
+
+    DetailedSyscallExit_write details -> formatDetails details
+
+    DetailedSyscallExit_read details -> formatDetails details
+
+    DetailedSyscallExit_close details -> formatDetails details
+
+    DetailedSyscallExit_rename details -> formatDetails details
+
+    DetailedSyscallExit_renameat details -> formatDetails details
+
+    DetailedSyscallExit_renameat2 details -> formatDetails details
+
+    DetailedSyscallExit_stat details -> formatDetails details
+
+    DetailedSyscallExit_fstat details -> formatDetails details
+
+    DetailedSyscallExit_lstat details -> formatDetails details
+
+    DetailedSyscallExit_newfstatat details -> formatDetails details
+
+    DetailedSyscallExit_mmap details -> formatDetails details
+
+    DetailedSyscallExit_symlink details -> formatDetails details
+
+    DetailedSyscallExit_symlinkat details -> formatDetails details
+
+    DetailedSyscallExit_time details -> formatDetails details
+
+    DetailedSyscallExit_brk details -> formatDetails details
+
+    DetailedSyscallExit_arch_prctl details -> formatDetails details
+
+    DetailedSyscallExit_set_tid_address details -> formatDetails details
+
+    DetailedSyscallExit_execve details -> formatDetails details
+
+    DetailedSyscallExit_exit details -> formatDetails details
+
+    DetailedSyscallExit_exit_group details -> formatDetails details
+
+    DetailedSyscallExit_unimplemented syscall syscallArgs result ->
+      handleUnimplemented syscall syscallArgs result
+
+  where
+    formatDetails :: SyscallExitFormatting a => a -> IO (FormattedSyscall, ReturnOrErrno)
+    formatDetails = pure . second ProperReturn . syscallExitToFormatted
 
 procToArgv :: (HasCallStack) => FilePath -> [String] -> IO [String]
 procToArgv name args = do
@@ -1701,10 +2067,15 @@ procToArgv name args = do
   pure (path:args)
 
 
-traceForkProcess :: (HasCallStack) => FilePath -> [String] -> IO ExitCode
-traceForkProcess name args = do
+traceForkProcess ::
+     (HasCallStack)
+  => FilePath
+  -> [String]
+  -> (HatraceEvent -> IO ())
+  -> IO ExitCode
+traceForkProcess name args printEvent = do
   argv <- procToArgv name args
-  traceForkExecvFullPath argv
+  traceForkExecvFullPath argv printEvent
 
 
 -- | The terminology in here is oriented on `man 2 ptrace`.
@@ -1725,6 +2096,19 @@ data PTRACE_EVENT
   | PTRACE_EVENT_SECCOMP
   | PTRACE_EVENT_OTHER -- TODO make this carry the number
   deriving (Eq, Ord, Show)
+
+
+instance ToJSON PTRACE_EVENT where
+  toJSON = \case
+    PTRACE_EVENT_VFORK pid -> object [ "PTRACE_EVENT_VFORK" .= show pid ]
+    PTRACE_EVENT_FORK pid -> object [ "PTRACE_EVENT_FORK" .= show pid ]
+    PTRACE_EVENT_CLONE pid -> object [ "PTRACE_EVENT_CLONE" .= show pid ]
+    PTRACE_EVENT_VFORK_DONE pid -> object [ "PTRACE_EVENT_VFORK_DONE" .= show pid ]
+    PTRACE_EVENT_EXEC -> "PTRACE_EVENT_EXEC"
+    PTRACE_EVENT_EXIT -> "PTRACE_EVENT_EXIT"
+    PTRACE_EVENT_STOP -> "PTRACE_EVENT_STOP"
+    PTRACE_EVENT_SECCOMP -> "PTRACE_EVENT_SECCOMP"
+    PTRACE_EVENT_OTHER -> "PTRACE_EVENT_OTHER"
 
 
 -- | The terminology in here is oriented on `man 2 ptrace`.
