@@ -925,7 +925,7 @@ instance SyscallExitFormatting SyscallExitDetails_time where
 
 
 data SyscallEnterDetails_mmap = SyscallEnterDetails_mmap
-  { address :: Ptr Void
+  { addr :: Ptr Void
   , len :: CSize
   , prot :: MemoryProtectMode
   , flags :: MMapMode
@@ -934,8 +934,8 @@ data SyscallEnterDetails_mmap = SyscallEnterDetails_mmap
   } deriving (Eq, Ord, Show)
 
 instance SyscallEnterFormatting SyscallEnterDetails_mmap where
-  syscallEnterToFormatted SyscallEnterDetails_mmap{ address, len, prot, flags, fd, offset } =
-    FormattedSyscall "mmap" [ formatArg address, formatArg len, formatArg prot
+  syscallEnterToFormatted SyscallEnterDetails_mmap{ addr, len, prot, flags, fd, offset } =
+    FormattedSyscall "mmap" [ formatArg addr, formatArg len, formatArg prot
                             , formatArg flags, formatArg fd, formatArg offset
                             ]
 
@@ -1313,7 +1313,7 @@ getSyscallEnterDetails syscall syscallArgs pid = let proc = TracedProcess pid in
     let SyscallArgs{ arg0 = addr, arg1 = len, arg2 = prot, arg3 = flags, arg4 = fd, arg5 = offset } = syscallArgs
     let addrPtr = word64ToPtr addr
     pure $ DetailedSyscallEnter_mmap $ SyscallEnterDetails_mmap
-      { address = addrPtr
+      { addr = addrPtr
       , len = fromIntegral len
       , prot = fromCInt $ fromIntegral prot
       , flags = fromCInt $ fromIntegral flags

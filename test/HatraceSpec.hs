@@ -600,7 +600,7 @@ spec = before_ assertNoChildren $ do
                 ) <- events
               ]
         let lastArguments = last mmapArguments
-        address lastArguments `shouldBe` nullPtr
+        addr (lastArguments :: SyscallEnterDetails_mmap) `shouldBe` nullPtr
         len lastArguments `shouldBe` fromIntegral (100 :: Int)
         formatArg (prot lastArguments) `shouldBe` FixedStringArg "PROT_READ"
         formatArg (flags (lastArguments :: SyscallEnterDetails_mmap)) `shouldBe` FixedStringArg "MAP_SHARED"
