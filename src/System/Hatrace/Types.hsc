@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <asm/prctl.h>
 
 module System.Hatrace.Types
   ( FileAccessMode(..)
@@ -13,14 +14,15 @@ module System.Hatrace.Types
   , fileExistence
   , StatStruct(..)
   , TimespecStruct(..)
+  , ArchPrctlSubfunction(..)
   , CIntRepresentable(..)
-  , HatraceShow(..)
   ) where
 
 import           Data.Bits
 import           Data.List (intercalate)
 import           Foreign.C.Types (CInt(..), CUInt(..), CLong(..), CULong(..))
 import           Foreign.Storable (Storable(..))
+import           System.Hatrace.Format
 
 -- | Helper type class for int-sized enum-like types
 class CIntRepresentable a where
@@ -32,19 +34,19 @@ data FileAccessMode
   | FileAccessUnknown CInt
   deriving (Eq, Ord, Show)
 
--- | Hatrace-specific show type class
-class HatraceShow a where
-  hShow :: a -> String
-
-instance HatraceShow FileAccessMode where
-  hShow (FileAccessKnown mode) =
-    let granularModes = concat
-          [ if accessModeRead mode then ["R_OK"] else []
-          , if accessModeWrite mode then ["W_OK"] else []
-          , if accessModeExecute mode then ["X_OK"] else []
-          ]
-    in if null granularModes then "F_OK" else intercalate "|" granularModes
-  hShow (FileAccessUnknown x) = show x
+-- TODO think about special handling for bit flags so they could
+-- be better represented in JSON for example
+instance ArgFormatting FileAccessMode where
+  formatArg = FixedStringArg . formatMode
+    where
+      formatMode (FileAccessKnown mode) =
+        let granularModes = concat
+              [ if accessModeRead mode then ["R_OK"] else []
+              , if accessModeWrite mode then ["W_OK"] else []
+              , if accessModeExecute mode then ["X_OK"] else []
+              ]
+        in if null granularModes then "F_OK" else intercalate "|" granularModes
+      formatMode (FileAccessUnknown x) = show x
 
 data GranularAccessMode = GranularAccessMode
   { accessModeRead :: Bool
@@ -81,16 +83,18 @@ data MemoryProtectMode
   | MemoryProtectUnknown CInt
   deriving (Eq, Ord, Show)
 
-instance HatraceShow MemoryProtectMode where
-  hShow (MemoryProtectKnown mode) =
-    let granularModes = concat 
-          [ if protectModeExec  mode then ["PROT_EXEC"]  else []
-          , if protectModeRead  mode then ["PROT_READ"]  else []
-          , if protectModeWrite mode then ["PROT_WRITE"] else []
-          , if protectModeNone  mode then ["PROT_NONE"]  else []
-          ]
-    in if null granularModes then "0" else intercalate "|" granularModes
-  hShow (MemoryProtectUnknown x) = show x
+instance ArgFormatting MemoryProtectMode where
+  formatArg = FixedStringArg . formatMode
+    where
+      formatMode (MemoryProtectKnown mode) =
+        let granularModes = concat 
+              [ if protectModeExec  mode then ["PROT_EXEC"]  else []
+              , if protectModeRead  mode then ["PROT_READ"]  else []
+              , if protectModeWrite mode then ["PROT_WRITE"] else []
+              , if protectModeNone  mode then ["PROT_NONE"]  else []
+              ]
+        in if null granularModes then "0" else intercalate "|" granularModes
+      formatMode (MemoryProtectUnknown x) = show x
 
 data GranularMemoryProtectMode = GranularMemoryProtectMode
   { protectModeExec :: Bool
@@ -124,43 +128,45 @@ data MMapMode
   | MMapModeUnknown CInt
   deriving (Eq, Ord, Show)
 
-instance HatraceShow MMapMode where
-  hShow (MMapModeKnown mode) =
-    let granularModes =
-          [ "MAP_SHARED"          | mapShared mode ] ++
-          [ "MAP_PRIVATE"         | mapPrivate mode ] ++
-          [ "MAP_32BIT"           | map32Bit mode ] ++
-          [ "MAP_ANON"            | mapAnon mode ] ++
-          [ "MAP_ANONYMOUS"       | mapAnonymous mode ] ++
-          [ "MAP_DENYWRITE"       | mapDenyWrite mode ] ++
-          [ "MAP_EXECUTABLE"      | mapExecutable mode ] ++
-          [ "MAP_FILE"            | mapFile mode ] ++
-          [ "MAP_FIXED"           | mapFixed mode ] ++
+instance ArgFormatting MMapMode where
+  formatArg = FixedStringArg . formatMode
+    where
+      formatMode (MMapModeKnown mode) =
+        let granularModes =
+              [ "MAP_SHARED"          | mapShared mode ] ++
+              [ "MAP_PRIVATE"         | mapPrivate mode ] ++
+              [ "MAP_32BIT"           | map32Bit mode ] ++
+              [ "MAP_ANON"            | mapAnon mode ] ++
+              [ "MAP_ANONYMOUS"       | mapAnonymous mode ] ++
+              [ "MAP_DENYWRITE"       | mapDenyWrite mode ] ++
+              [ "MAP_EXECUTABLE"      | mapExecutable mode ] ++
+              [ "MAP_FILE"            | mapFile mode ] ++
+              [ "MAP_FIXED"           | mapFixed mode ] ++
 #ifdef MAP_FIXED_NOREPLACE
-          [ "MAP_FIXED_NOREPLACE" | mapFixedNoreplace mode ] ++
+              [ "MAP_FIXED_NOREPLACE" | mapFixedNoreplace mode ] ++
 #endif
-          [ "MAP_GROWSDOWN"       | mapGrowsdown mode ] ++
-          [ "MAP_HUGETLB"         | mapHugetlb mode ] ++
+              [ "MAP_GROWSDOWN"       | mapGrowsdown mode ] ++
+              [ "MAP_HUGETLB"         | mapHugetlb mode ] ++
 #ifdef MAP_HUGE_2MB
-          [ "MAP_HUGE_2MB"        | mapHuge2Mb mode ] ++
+              [ "MAP_HUGE_2MB"        | mapHuge2Mb mode ] ++
 #endif
 #ifdef MAP_HUGE_1GB
-          [ "MAP_HUGE_1GB"        | mapHuge1Gb mode ] ++
+              [ "MAP_HUGE_1GB"        | mapHuge1Gb mode ] ++
 #endif
-          [ "MAP_LOCKED"          | mapLocked mode ] ++
-          [ "MAP_NONBLOCK"        | mapNonblock mode ] ++
-          [ "MAP_NORESERVE"       | mapNoReserve mode ] ++
-          [ "MAP_POPULATE"        | mapPopulate mode ] ++
-          [ "MAP_STACK"           | mapStack mode ] ++
+              [ "MAP_LOCKED"          | mapLocked mode ] ++
+              [ "MAP_NONBLOCK"        | mapNonblock mode ] ++
+              [ "MAP_NORESERVE"       | mapNoReserve mode ] ++
+              [ "MAP_POPULATE"        | mapPopulate mode ] ++
+              [ "MAP_STACK"           | mapStack mode ] ++
 #ifdef MAP_SYNC
-          [ "MAP_SYNC"            | mapSync mode ] ++
+              [ "MAP_SYNC"            | mapSync mode ] ++
 #endif
 #ifdef MAP_UNINITIALIZED
-          [ "MAP_UNINITIALIZED"   | mapUninitialized mode ] ++
+              [ "MAP_UNINITIALIZED"   | mapUninitialized mode ] ++
 #endif
-          []
-    in if null granularModes then "0" else intercalate "|" granularModes
-  hShow (MMapModeUnknown x) = show x
+              []
+        in if null granularModes then "0" else intercalate "|" granularModes
+      formatMode (MMapModeUnknown x) = show x
 
 data GranularMMapMode = GranularMMapMode
   { mapShared :: Bool
@@ -353,10 +359,25 @@ instance Storable StatStruct where
     #{poke struct stat, st_mtim} p st_mtim
     #{poke struct stat, st_ctim} p st_ctim
 
--- | following strace output
-instance HatraceShow StatStruct where
-  hShow StatStruct{..} =
-    "{s_mode=" ++ show st_mode ++ ", st_size=" ++ show st_size ++ ", ..}"
+-- outputtting st_mode and st_size first following strace
+-- which appears to output only those
+instance ArgFormatting StatStruct where
+  formatArg StatStruct {..} =
+    StructArg
+      [ ("st_mode", formatArg st_mode)
+      , ("st_size", formatArg st_size)
+      , ("st_dev", formatArg st_dev)
+      , ("st_ino", formatArg st_ino)
+      , ("st_nlink", formatArg st_nlink)
+      , ("st_uid", formatArg st_uid)
+      , ("st_gid", formatArg st_gid)
+      , ("st_rdev", formatArg st_rdev)
+      , ("st_blksize", formatArg st_blksize)
+      , ("st_blocks", formatArg st_blocks)
+      , ("st_atim", formatArg st_atim)
+      , ("st_mtim", formatArg st_mtim)
+      , ("st_ctim", formatArg st_ctim)
+      ]
 
 data TimespecStruct = TimespecStruct
   { tv_sec :: CLong -- ^ Seconds
@@ -373,3 +394,35 @@ instance Storable TimespecStruct where
   poke p TimespecStruct{..} = do
     #{poke struct timespec, tv_sec} p tv_sec
     #{poke struct timespec, tv_nsec} p tv_nsec
+
+instance ArgFormatting TimespecStruct where
+  formatArg TimespecStruct {..} =
+    StructArg [("tv_sec", formatArg tv_sec), ("tv_nsec", formatArg tv_nsec)]
+
+data ArchPrctlSubfunction
+  = ArchSetFs
+  | ArchGetFs
+  | ArchSetGs
+  | ArchGetGs
+  | ArchUnknownSubfunction CInt
+  deriving (Eq, Ord, Show)
+
+instance CIntRepresentable ArchPrctlSubfunction where
+  toCInt ArchSetFs = (#const ARCH_SET_FS)
+  toCInt ArchGetFs = (#const ARCH_GET_FS)
+  toCInt ArchSetGs = (#const ARCH_SET_GS)
+  toCInt ArchGetGs = (#const ARCH_GET_GS)
+  toCInt (ArchUnknownSubfunction unknown) = unknown
+  fromCInt (#const ARCH_SET_FS) = ArchSetFs
+  fromCInt (#const ARCH_GET_FS) = ArchGetFs
+  fromCInt (#const ARCH_SET_GS) = ArchSetGs
+  fromCInt (#const ARCH_GET_GS) = ArchGetGs
+  fromCInt unknown = ArchUnknownSubfunction unknown
+
+instance ArgFormatting ArchPrctlSubfunction where
+  formatArg ArchSetFs = FixedStringArg "ARCH_SET_FS"
+  formatArg ArchGetFs = FixedStringArg "ARCH_GET_FS"
+  formatArg ArchSetGs = FixedStringArg "ARCH_SET_GS"
+  formatArg ArchGetGs = FixedStringArg "ARCH_GET_GS"
+  formatArg (ArchUnknownSubfunction unknown) =
+    IntegerArg (fromIntegral unknown)

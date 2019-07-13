@@ -13,6 +13,7 @@ import           Data.Conduit
 import qualified Data.Conduit.Combinators as CC
 import qualified Data.Conduit.List as CL
 import qualified Data.Map as Map
+import           Data.Maybe (fromMaybe)
 import           Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.Text as T
@@ -28,12 +29,13 @@ import           System.Posix.Files (getFileStatus, fileSize, readSymbolicLink)
 import           System.Posix.Resource (Resource(..), ResourceLimit(..), ResourceLimits(..), getResourceLimit, setResourceLimit)
 import           System.Posix.Signals (sigTERM)
 import           System.Process (callProcess, readProcess)
-import           System.Hatrace.Types (hShow)
 import           Test.Hspec
 import           Text.Read (readMaybe)
 import           UnliftIO.Exception (bracket)
 
 import System.Hatrace
+import System.Hatrace.Format
+import System.Hatrace.Types
 
 
 -- | Assertion we run before each test to ensure no leftover child processes
@@ -66,24 +68,26 @@ spec = before_ assertNoChildren $ do
   -- hspec swallows test failure messages if after the test faulure the
   -- `after_` action fails as well, showing only the latter's message.
 
+  let muted _ = return ()
+
   describe "traceCreateProcess" $ do
 
     it "does not crash for this echo process" $ do
-      traceForkProcess "echo" ["hello"] `shouldReturn` ExitSuccess
+      traceForkProcess "echo" ["hello"] muted  `shouldReturn` ExitSuccess
 
     -- TODO Instead of compiling things here with `make`, do it as a Cabal hook.
 
     it "does not crash for hello.asm with 32-bit API" $ do
       callProcess "make" ["--quiet", "example-programs-build/hello-linux-i386-elf64"]
-      traceForkProcess "example-programs-build/hello-linux-i386-elf64" [] `shouldReturn` ExitSuccess
+      traceForkProcess "example-programs-build/hello-linux-i386-elf64" [] muted `shouldReturn` ExitSuccess
 
     it "does not crash for hello.asm real 32-bit" $ do
       callProcess "make" ["--quiet", "example-programs-build/hello-linux-i386"]
-      traceForkProcess "example-programs-build/hello-linux-i386" [] `shouldReturn` ExitSuccess
+      traceForkProcess "example-programs-build/hello-linux-i386" [] muted `shouldReturn` ExitSuccess
 
     it "does not crash for hello.asm with 64-bit API" $ do
       callProcess "make" ["--quiet", "example-programs-build/hello-linux-x86_64"]
-      traceForkProcess "example-programs-build/hello-linux-x86_64" [] `shouldReturn` ExitSuccess
+      traceForkProcess "example-programs-build/hello-linux-x86_64" [] muted `shouldReturn` ExitSuccess
 
     it "does not hang when the traced program segfaults" $ do
       callProcess "make" ["--quiet", "example-programs-build/segfault"]
@@ -101,7 +105,7 @@ spec = before_ assertNoChildren $ do
         -- present.
         --
         -- See also: core(5) - accessible by running `man 5 core`.
-        exitCode <- traceForkProcess "example-programs-build/segfault" []
+        exitCode <- traceForkProcess "example-programs-build/segfault" [] muted
         exitCode `shouldSatisfy` \x ->
           x `elem` [ExitFailure 11, ExitFailure (128+11)]
 
@@ -598,8 +602,8 @@ spec = before_ assertNoChildren $ do
         let lastArguments = last mmapArguments
         address lastArguments `shouldBe` nullPtr
         len lastArguments `shouldBe` fromIntegral (100 :: Int)
-        hShow (prot lastArguments) `shouldBe` "PROT_READ"
-        hShow (flags (lastArguments :: SyscallEnterDetails_mmap)) `shouldBe` "MAP_SHARED"
+        formatArg (prot lastArguments) `shouldBe` FixedStringArg "PROT_READ"
+        formatArg (flags (lastArguments :: SyscallEnterDetails_mmap)) `shouldBe` FixedStringArg "MAP_SHARED"
         offset lastArguments `shouldBe` fromIntegral (0 :: Int)
 
     describe "time" $ do
@@ -611,14 +615,14 @@ spec = before_ assertNoChildren $ do
             syscallExitDetailsOnlyConduit .| CL.consume
         exitCode `shouldBe` ExitSuccess
         let timeDetails =
-              [ (timeResult > 0, (> 0) <$> tlocValue)
+              [ (timeResult > 0)
               | (_pid
                 , Right (DetailedSyscallExit_time
                          SyscallExitDetails_time
-                         { timeResult, tlocValue })
+                         { timeResult })
                 ) <- events
               ]
-        timeDetails `shouldBe` [(True, Nothing), (True, Just True)]
+        timeDetails `shouldBe` [True, True]
 
     describe "brk" $ do
       it "has correct output after changing program break" $ do
@@ -643,3 +647,92 @@ spec = before_ assertNoChildren $ do
         initArg `shouldBe` nullPtr
         elem (extAddr, extAddr) brkCallAddresses `shouldBe` True
         elem (initAddr, initAddr) brkCallAddresses `shouldBe` True
+
+    describe "symlink" $ do
+      it "seen exactly once for 'ln -s tempfile tempfilesymlink'" $ do
+        tmpFile <- emptySystemTempFile "test-output"
+        let symlinkPath = tmpFile ++ "symlink"
+        argv <- procToArgv "bash" ["-c", "ln -s " ++ tmpFile ++ " " ++ symlinkPath]
+        (exitCode, events) <-
+          sourceTraceForkExecvFullPathWithSink argv $
+            syscallExitDetailsOnlyConduit .| CL.consume
+        exitCode `shouldBe` ExitSuccess
+        -- it was observed that on different distros 'ln -s' could use either
+        -- symlink or symlinkat
+        let maybeSymlinkPath exitDetails = case exitDetails of
+              DetailedSyscallExit_symlink
+                SyscallExitDetails_symlink
+                { enterDetail = SyscallEnterDetails_symlink{ linkpathBS }} ->
+                Just linkpathBS
+              DetailedSyscallExit_symlinkat
+                SyscallExitDetails_symlinkat
+                { enterDetail = SyscallEnterDetails_symlinkat{ linkpathBS }} ->
+                Just linkpathBS
+              _ ->
+                Nothing
+            symlinkEvents =
+              [ exitDetails
+              | (_pid, Right exitDetails) <- events
+              , fromMaybe False $ do
+                  linkpathBS <- maybeSymlinkPath exitDetails
+                  return $ linkpathBS == T.encodeUtf8 (T.pack symlinkPath)
+              ]
+        length symlinkEvents `shouldBe` 1
+
+    describe "symlinkat" $ do
+      it "seen exactly once for './symlinkat" $ do
+        callProcess "make" ["--quiet", "example-programs-build/symlinkat"]
+        tmpFile <- emptySystemTempFile "test-output"
+        let symlinkPath = tmpFile ++ "symlink"
+        argv <- procToArgv "example-programs-build/symlinkat" [tmpFile, symlinkPath]
+        (exitCode, events) <-
+          sourceTraceForkExecvFullPathWithSink argv $
+            syscallExitDetailsOnlyConduit .| CL.consume
+        exitCode `shouldBe` ExitSuccess
+        let symlinkEvents =
+              [ linkpathBS
+              | (_pid
+                , Right (DetailedSyscallExit_symlinkat
+                         SyscallExitDetails_symlinkat
+                         { enterDetail = SyscallEnterDetails_symlinkat{ linkpathBS }})
+                ) <- events
+                , linkpathBS == T.encodeUtf8 (T.pack symlinkPath)
+              ]
+        length symlinkEvents `shouldBe` 1
+
+    describe "arch_prctl" $ do
+      it "seen ARCH_GET_FS used by example executable" $ do
+        callProcess "make" ["--quiet", "example-programs-build/get-fs"]
+        argv <- procToArgv "example-programs-build/get-fs" []
+        (exitCode, events) <-
+          sourceTraceForkExecvFullPathWithSink argv $
+            syscallExitDetailsOnlyConduit .| CL.consume
+        exitCode `shouldBe` ExitSuccess
+        let subfunctions =
+              [ subfunction enterDetail
+              | (_pid
+                , Right (DetailedSyscallExit_arch_prctl
+                         SyscallExitDetails_arch_prctl
+                         { enterDetail })
+                ) <- events
+              ]
+        subfunctions `shouldSatisfy` (ArchGetFs `elem`)
+
+    describe "set_tid_address" $ do
+      it "seen set_tid_address used by example executable" $ do
+        let progName = "example-programs-build/set-tid-address"
+        callProcess "make" ["--quiet", progName]
+        argv <- procToArgv progName []
+        (exitCode, events) <-
+          sourceTraceForkExecvFullPathWithSink argv $
+            syscallExitDetailsOnlyConduit .| CL.consume
+        exitCode `shouldBe` ExitSuccess
+        let sets =
+              [ tidptr enterDetail
+              | (_pid
+                , Right (DetailedSyscallExit_set_tid_address
+                         SyscallExitDetails_set_tid_address
+                         { enterDetail })
+                ) <- events
+              ]
+        sets `shouldSatisfy` (not . null)
